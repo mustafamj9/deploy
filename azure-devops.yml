@@ -1,0 +1,24 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- task: AzureCLI@2
+  displayName: 'Azure Login'
+  inputs:
+    azureSubscription: 'Your Azure Subscription'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az login --service-principal -u APP_ID -p PASSWORD --tenant TENANT_ID
+
+- task: AzureCLI@2
+  displayName: 'Execute Azure CLI command'
+  inputs:
+    azureSubscription: 'Your Azure Subscription'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az <your_command_here>
