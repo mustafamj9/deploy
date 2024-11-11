@@ -4,31 +4,41 @@ Connect-AzAccount
 # Get all subscriptions
 $subscriptions = Get-AzSubscription
 
-# Extract all subscription IDs
-$subscriptionIds = $subscriptions.Id
-
-# Get all VMs from all subscriptions in a single query
-$vms = Get-AzVM -SubscriptionId $subscriptionIds
-
 # Initialize an array to store results
 $vmList = @()
 
-# Loop through each VM to get network information
-foreach ($vm in $vms) {
-    # Get the network interface attached to the VM
-    $nic = Get-AzNetworkInterface -ResourceGroupName $vm.ResourceGroupName -Name $vm.NetworkProfile.NetworkInterfaces[0].Id.Split('/')[-1] -SubscriptionId $vm.Id.Split('/')[2]
-    
-    # Get private IP of the primary IP configuration
-    $privateIp = $nic.IpConfigurations[0].PrivateIpAddress
+# Loop through each subscription
+foreach ($sub in $subscriptions) {
+    # Set the context to the current subscription
+    Set-AzContext -SubscriptionId $sub.Id
 
-    # Add VM info to list
-    $vmList += [PSCustomObject]@{
-        SubscriptionId = $vm.Id.Split('/')[2]
-        ResourceGroup = $vm.ResourceGroupName
-        VMName = $vm.Name
-        PrivateIpAddress = $privateIp
+    # Get all VMs in the subscription
+    $vms = Get-AzVM
+
+    # Loop through each VM to get network information
+    foreach ($vm in $vms) {
+        # Get the network interface attached to the VM
+        $nicId = $vm.NetworkProfile.NetworkInterfaces[0].Id
+        $nic = Get-AzNetworkInterface -ResourceId $nicId
+        
+        # Get private IP of the primary IP configuration
+        $privateIp = $nic.IpConfigurations[0].PrivateIpAddress
+
+        # Add VM info to list
+        $vmList += [PSCustomObject]@{
+            SubscriptionId = $sub.Id
+            SubscriptionName = $sub.Name
+            ResourceGroup = $vm.ResourceGroupName
+            VMName = $vm.Name
+            PrivateIpAddress = $privateIp
+        }
     }
 }
 
-# Output the list of VMs with private IPs
-$vmList | Format-Table -AutoSize
+# Define output file path
+$outputFilePath = "C:\VMsWithPrivateIPs.xlsx"
+
+# Export to Excel
+$vmList | Export-Excel -Path $outputFilePath -AutoSize
+
+Write-Output "VM details have been exported to $outputFilePath"
