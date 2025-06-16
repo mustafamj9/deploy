@@ -1,5 +1,0 @@
-Event
-| where EventLog == "System"  // Filter for system event logs (adjust as needed)
-| where EventLevelName == "Error"  // Filter for error-level events
-| where EventID == 502  // Filter for HTTP 502 errors (adjust as needed)
-| project TimeGenerated, Computer, EventID, RenderedDescription
