@@ -1,4 +1,0 @@
-AzureDiagnostics
-| where ResourceType == "APPLICATIONGATEWAYS" and OperationName == "ApplicationGatewayAccess" 
-| where toint(StatusCode) >= 500 and toint(StatusCode) < 600
-| summarize count() by bin(TimeGenerated, 5m), StatusCode, Resource
