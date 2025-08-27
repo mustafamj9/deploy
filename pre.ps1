@@ -15,6 +15,7 @@
 
 # ---------------- CONFIG ----------------
 # Full path to azcopy.exe
+# to find out the path Get-ChildItem -Path "C:\Users\musta\Downloads" -Recurse -Filter "azcopy.exe"
 $azCopyExe = "<AZCOPY_EXE_PATH>"  # e.g. C:\Tools\AzCopy\azcopy.exe
 
 # SAS URL to the SOURCE share (NO subdir appended here)
