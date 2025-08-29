@@ -1,72 +1,78 @@
-<#
-    AzCopy: Copy ONLY the contents of a subdirectory from one Azure Files share to another
-    - Copies contents of <SRC_SUBDIR> into <DST_SUBDIR> (no extra parent folder)
-    - Uses SAS URLs. Do NOT commit real SAS tokens.
-    - Requires AzCopy v10+
+$ErrorActionPreference = "Stop"
+$VerbosePreference     = "Continue"
 
-    HOW TO USE:
-      1) Replace placeholders <> below with your values.
-      2) Run in PowerShell.
-      3) Ensure the SAS tokens have:
-         - Service: File (ss includes 'f')
-         - Resource types: Service, Container, Object (srt = 'sco')
-         - Permissions: source needs at least read+list; destination needs create+write+list (+update/delete if overwriting)
-#>
+# --- YOUR VALUES (from chat) ---
+$SourceAccountName  = ''
+$SourceAccountKey   = ''
 
-# ---------------- CONFIG ----------------
-# Full path to azcopy.exe
-# to find out the path Get-ChildItem -Path "C:\Users\musta\Downloads" -Recurse -Filter "azcopy.exe"
-$azCopyExe = "<AZCOPY_EXE_PATH>"  # e.g. C:\Tools\AzCopy\azcopy.exe
+$DestAccountName    = ''
+$DestAccountKey     = ''
 
-# SAS URL to the SOURCE share (NO subdir appended here)
-# EXAMPLE SHAPE: https://<SRC_ACCOUNT>.file.core.windows.net/<SHARE_NAME>?<SAS>
-$sourceUrl = "https://<SRC_ACCOUNT>.file.core.windows.net/<SRC_SHARE>?<SRC_SAS>"
+$ShareName          = 'name'
+$BasePath           = 'main/test'   # <-- we copy everything under this folder
 
-# SAS URL to the DESTINATION share (NO subdir appended here)
-# EXAMPLE SHAPE: https://<DST_ACCOUNT>.file.core.windows.net/<SHARE_NAME>?<DST_SAS>
-$destUrl   = "https://<DST_ACCOUNT>.file.core.windows.net/<DST_SHARE>?<DST_SAS>"
+# --- Contexts ---
+$srcCtx  = New-AzStorageContext -StorageAccountName $SourceAccountName -StorageAccountKey $SourceAccountKey
+$destCtx = New-AzStorageContext -StorageAccountName $DestAccountName   -StorageAccountKey $DestAccountKey
 
-# Subdirectory to copy (same relative path on both sides)
-# IMPORTANT: This is the directory whose CONTENTS will be copied.
-$srcSubDir = "<SRC_SUBDIR_RELATIVE_PATH>"  # e.g.
-$dstSubDir = "<DST_SUBDIR_RELATIVE_PATH>"  # e.g.
+# --- Ensure destination share & base folder exist ---
+if (-not (Get-AzStorageShare -Context $destCtx -Name $ShareName -ErrorAction SilentlyContinue)) {
+  Write-Verbose "Creating destination share '$ShareName'..."
+  New-AzStorageShare -Context $destCtx -Name $ShareName | Out-Null
+}
+# Ensure 'main' exists on destination
+New-AzStorageDirectory -Context $destCtx -ShareName $ShareName -Path $BasePath -ErrorAction SilentlyContinue | Out-Null
 
-# ---------------- HELPERS ----------------
-# Inserts the relative path BEFORE the ?SAS. Optionally adds:
-#   - "/*" to copy only contents of a folder
-#   - "/"  to force destination to be treated as a directory
-function Build-Url {
-    param(
-        [Parameter(Mandatory)][string]$baseSasUrl,
-        [Parameter(Mandatory)][string]$relPath,
-        [string]$suffix = ""
-    )
-    $parts = $baseSasUrl -split '\?', 2
-    $base  = $parts[0].TrimEnd('/')
-    $sas   = if ($parts.Count -gt 1) { '?' + $parts[1] } else { '' }
-    return "$base/$relPath$suffix$sas"
+# --- Helpers ---
+function Ensure-DestDirectory([string]$RelativePath) {
+  if ([string]::IsNullOrWhiteSpace($RelativePath)) { return }
+  New-AzStorageDirectory -Context $destCtx -ShareName $ShareName -Path $RelativePath -ErrorAction SilentlyContinue | Out-Null
 }
 
-# ---------------- BUILD FINAL URLS ----------------
-# Source = contents only => add "/*" so we copy files/folders inside the subdir, not the subdir itself
-$srcUrlContents = Build-Url -baseSasUrl $sourceUrl -relPath $srcSubDir -suffix "/*"
+function Get-Children([string]$RelPath) {
+  # List children of the given directory path using pipeline style (works across Az.Storage versions)
+  $dir = Get-AzStorageFile -ShareName $ShareName -Path $RelPath -Context $srcCtx
+  return $dir | Get-AzStorageFile -Context $srcCtx
+}
 
-# Destination = target directory => add trailing "/" so AzCopy treats it as a directory
-$dstUrlDir      = Build-Url -baseSasUrl $destUrl   -relPath $dstSubDir -suffix "/"
+# Robust type checks across Az.Storage versions
+function Is-Directory($item) { return ($item.GetType().Name -like '*Directory*') }
+function Is-File($item)      { return ($item.GetType().Name -like '*File' -and -not (Is-Directory $item)) }
 
-# ---------------- ENSURE DESTINATION FOLDER EXISTS (idempotent) ----------------
-# Creates the destination folder chain if missing. Safe to run repeatedly.
-& $azCopyExe make $dstUrlDir | Out-Null
+function Copy-UnderBase([string]$CurrentPath) {
+  # $CurrentPath is always a subpath under $BasePath (e.g., 'main', 'main/dcs', ...)
+  $children = Get-Children $CurrentPath
 
-# ---------------- COPY (INCREMENTAL) ----------------
-# Copies all files and subfolders from source subdir CONTENTS into the destination directory.
-# Does NOT delete anything at destination.
-& $azCopyExe copy $srcUrlContents $dstUrlDir --recursive --overwrite=ifSourceNewer
+  foreach ($child in $children) {
+    if (Is-Directory $child) {
+      $name       = $child.Name
+      $childPath  = "$CurrentPath/$name"   # still under 'main/...'
+      Ensure-DestDirectory $childPath
+      Copy-UnderBase $childPath
+    }
+    elseif (Is-File $child) {
+      $fileRel = "$CurrentPath/$($child.Name)"  # e.g., 'main/file.txt' or 'main/dcs/a.txt'
+      $parent  = Split-Path $fileRel -Parent
+      if ($parent) { Ensure-DestDirectory $parent }
 
-# ---------------- NOTES ----------------
-# - If you want to *mirror* (delete extras on destination), use `azcopy sync` instead of copy:
-#     & $azCopyExe sync (Build-Url $sourceUrl $srcSubDir "/") (Build-Url $destUrl $dstSubDir "/") --recursive --delete-destination=true
-#   (Make sure the destination parent path exists first; and consider running with --dry-run.)
-# - If you need to preserve SMB ACLs/attributes (supported on both accounts), add:
-#     --preserve-smb-permissions=true --preserve-smb-info=true
-# - Keep SAS tokens short-lived and NEVER commit real SAS to source control.
+      Write-Verbose "Copying '$fileRel' ..."
+      Start-AzStorageFileCopy `
+        -SrcShareName  $ShareName -SrcFilePath  $fileRel -Context $srcCtx `
+        -DestShareName $ShareName -DestFilePath $fileRel -DestContext $destCtx `
+        -Force | Out-Null
+    }
+  }
+}
+
+# --- Validate source base folder exists ---
+$null = Get-AzStorageFile -ShareName $ShareName -Path $BasePath -Context $srcCtx  # throws 404 if missing
+
+Write-Verbose "Copying CONTENTS of '$SourceAccountName/$ShareName/$BasePath' to '$DestAccountName/$ShareName/$BasePath' ..."
+Copy-UnderBase $BasePath
+Write-Host "✅ All copy operations submitted for '$BasePath/*'. (Server-side copies will continue in Azure.)"
+
+# --- Optional: uncomment to wait for each file to complete before finishing
+# After Start-AzStorageFileCopy above, insert:
+# $destFile = Get-AzStorageFile -Context $destCtx -ShareName $ShareName -Path $fileRel
+# do { Start-Sleep -Seconds 2; $state = Get-AzStorageFileCopyState -File $destFile } while ($state.Status -eq "Pending")
+# if ($state.Status -ne "Success") { throw "Copy failed for $fileRel: $($state.StatusDescription)" }
