@@ -1,110 +1,75 @@
-# --- Authenticate to Azure using Managed Identity ---
-Write-Output "Logging in to Azure.."
-Connect-AzAccount -Identity | Out-Null
-Write-Output "Connected to Azure using automation account's Managed Identity"
+param(
+    [switch]$Apply,                     # run with -Apply to actually write files
+    [string]$AllowedUser = "$env:USERNAME"  # default: only allow the current user; change if needed
+)
 
-$ErrorActionPreference = "Stop"
-$VerbosePreference     = "Continue"
-
-# --- Automation Account Variables ---
-$SourceAccountName  = Get-AutomationVariable -Name "SourceAccountName"
-$SourceAccountKey   = Get-AutomationVariable -Name "SourceAccountKey"
-$DestAccountName    = Get-AutomationVariable -Name "DestAccountName"
-$DestAccountKey     = Get-AutomationVariable -Name "DestAccountKey"
-$ShareName          = Get-AutomationVariable -Name "ShareName"
-$BasePath           = Get-AutomationVariable -Name "BasePath"
-
-Write-Output "Using Source=$SourceAccountName, Dest=$DestAccountName, Share=$ShareName, Path=$BasePath"
-
-# --- Storage Contexts ---
-$srcCtx  = New-AzStorageContext -StorageAccountName $SourceAccountName -StorageAccountKey $SourceAccountKey
-$destCtx = New-AzStorageContext -StorageAccountName $DestAccountName   -StorageAccountKey $DestAccountKey
-
-# --- Counters ---
-$global:FilesCopied   = 0
-$global:FilesDeleted  = 0
-$global:DirsDeleted   = 0
-
-# --- Ensure destination share & base folder exist ---
-if (-not (Get-AzStorageShare -Context $destCtx -Name $ShareName -ErrorAction SilentlyContinue)) {
-  Write-Output "Creating destination share '$ShareName'..."
-  New-AzStorageShare -Context $destCtx -Name $ShareName | Out-Null
+# quick safety: only allow a specific user to run the destructive action
+if ($env:USERNAME -ne $AllowedUser) {
+    Write-Warning "This script can only be run by user '$AllowedUser'. Current user: $env:USERNAME. Exiting."
+    exit 1
 }
-New-AzStorageDirectory -Context $destCtx -ShareName $ShareName -Path $BasePath -ErrorAction SilentlyContinue | Out-Null
 
-# --- Helpers ---
-function Ensure-DestDirectory([string]$RelativePath) { 
-  if ($RelativePath) { New-AzStorageDirectory -Context $destCtx -ShareName $ShareName -Path $RelativePath -ErrorAction SilentlyContinue | Out-Null }
+# files to update (edit as needed)
+$files = @(
+    'D:\property\yoyoyoy.txt',
+    'D:\gymflow-membership-nexus\backend\db.js'
+)
+
+$backupRoot = 'E:\software\backup'
+if (-not (Test-Path -LiteralPath $backupRoot)) { New-Item -Path $backupRoot -ItemType Directory -Force | Out-Null }
+
+Write-Host "Files that would be processed:"
+$files | ForEach-Object { Write-Host " - $_" }
+
+if (-not $Apply) {
+    Write-Host ""
+    Write-Host "DRY RUN (no changes). To apply changes, re-run with the -Apply switch."
+    exit 0
 }
-function Get-Children([string]$RelPath, $ctx) { (Get-AzStorageFile -ShareName $ShareName -Path $RelPath -Context $ctx) | Get-AzStorageFile -Context $ctx }
-function Is-Directory($item) { $item.GetType().Name -like '*Directory*' }
-function Is-File($item)      { $item.GetType().Name -like '*File' -and -not (Is-Directory $item) }
 
-# --- Recursive Copy ---
-function Copy-UnderBase([string]$CurrentPath) {
-  foreach ($child in Get-Children $CurrentPath $srcCtx) {
-    if (Is-Directory $child) {
-      $childPath = "$CurrentPath/$($child.Name)"
-      Ensure-DestDirectory $childPath
-      Copy-UnderBase $childPath
+# final interactive confirmation before any destructive action
+$consent = Read-Host "You passed -Apply. Type 'YES' (all caps) to confirm you want to proceed and modify files"
+if ($consent -ne 'YES') {
+    Write-Host "Confirmation not received. Exiting without changes."
+    exit 0
+}
+
+foreach ($filePath in $files) {
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Write-Warning "File not found, skipping: $filePath"
+        continue
     }
-    elseif (Is-File $child) {
-      $fileRel = "$CurrentPath/$($child.Name)"
-      Ensure-DestDirectory (Split-Path $fileRel -Parent)
-      Write-Output "Copying '$fileRel' ..."
-      Start-AzStorageFileCopy -SrcShareName $ShareName -SrcFilePath $fileRel -Context $srcCtx `
-                              -DestShareName $ShareName -DestFilePath $fileRel -DestContext $destCtx -Force | Out-Null
-      $global:FilesCopied++
+
+    # timestamped backup
+    $timeStamp  = (Get-Date).ToString('yyyyMMdd-HHmmss')
+    $backupPath = Join-Path $backupRoot ((Split-Path $filePath -Leaf) + ".$timeStamp.bak")
+    Copy-Item -LiteralPath $filePath -Destination $backupPath -Force
+    Write-Host "Backup created: $backupPath"
+
+    # read full file
+    $content = Get-Content -LiteralPath $filePath -Raw
+
+    if ($filePath -like '*.env' -or $filePath -like '*.txt') {
+        # for env/txt → replace only in value side
+        $lines = $content -split "`r?`n"
+        $updatedLines = foreach ($line in $lines) {
+            if ($line -match '^(.*?=)(.*)$') {
+                $left  = $matches[1]
+                $right = $matches[2]
+                $newRight = [regex]::Replace($right, 'muscle', 'plzz', 'IgnoreCase')
+                "$left$newRight"
+            } else { $line }
+        }
+        $updatedContent = $updatedLines -join "`r`n"
     }
-  }
-}
-
-# --- Recursive Delete (dir + children) ---
-function Remove-DirectoryRecursive([string]$RelPath) {
-  foreach ($child in Get-Children $RelPath $destCtx) {
-    $childPath = "$RelPath/$($child.Name)"
-    if (Is-Directory $child) { Remove-DirectoryRecursive $childPath }
-    elseif (Is-File $child)  { Write-Output "Deleting file '$childPath' ..."; Remove-AzStorageFile -ShareName $ShareName -Path $childPath -Context $destCtx; $global:FilesDeleted++ }
-  }
-  Write-Output "Deleting directory '$RelPath' ..."
-  Remove-AzStorageDirectory -ShareName $ShareName -Path $RelPath -Context $destCtx
-  $global:DirsDeleted++
-}
-
-# --- Cleanup stale files/dirs in dest ---
-function Cleanup-UnderBase([string]$CurrentPath) {
-  foreach ($dChild in Get-Children $CurrentPath $destCtx) {
-    $dRelPath = "$CurrentPath/$($dChild.Name)"
-    if (Is-Directory $dChild) {
-      if (-not (Get-AzStorageFile -ShareName $ShareName -Path $dRelPath -Context $srcCtx -ErrorAction SilentlyContinue)) {
-        Write-Output "Removing stale directory '$dRelPath' recursively ..."
-        Remove-DirectoryRecursive $dRelPath
-      } else { Cleanup-UnderBase $dRelPath }
+    else {
+        # for db.js or any other → replace every "muscle" with "plzz"
+        $updatedContent = [regex]::Replace($content, 'muscle', 'plzz', 'IgnoreCase')
     }
-    elseif (Is-File $dChild) {
-      if (-not (Get-AzStorageFile -ShareName $ShareName -Path $dRelPath -Context $srcCtx -ErrorAction SilentlyContinue)) {
-        Write-Output "Removing stale file '$dRelPath' ..."
-        Remove-AzStorageFile -ShareName $ShareName -Path $dRelPath -Context $destCtx
-        $global:FilesDeleted++
-      }
-    }
-  }
+
+    # write back
+    Set-Content -LiteralPath $filePath -Value $updatedContent -Encoding UTF8
+    Write-Host "Updated: $filePath"
 }
 
-# --- Run Sync with Validation ---
-try {
-    # validate source base path exists
-    $null = Get-AzStorageFile -ShareName $ShareName -Path $BasePath -Context $srcCtx -ErrorAction Stop
-    Write-Output "Starting sync from '$SourceAccountName/$ShareName/$BasePath' to '$DestAccountName/$ShareName/$BasePath' ..."
-    Copy-UnderBase $BasePath
-    Cleanup-UnderBase $BasePath
-
-    # --- Final Summary ---
-    Write-Output "✅ Sync complete for '$BasePath'"
-    Write-Output "Summary: $global:FilesCopied files copied, $global:FilesDeleted files deleted, $global:DirsDeleted directories deleted."
-}
-catch {
-    Write-Output "❌ ERROR: Could not access source '$SourceAccountName/$ShareName/$BasePath'."
-    Write-Output "Reason: $($_.Exception.Message)"
-    throw  # rethrow so the Automation job fails cleanly
-}
+Write-Host "All done. Backups saved in $backupRoot"
