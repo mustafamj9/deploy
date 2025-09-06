@@ -1,62 +1,29 @@
-param (
-    [Parameter(Mandatory = $true)]
-    [string]$sourceSubscriptionId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$sourceStorageAccount,
-
-    [Parameter(Mandatory = $true)]
-    [string]$sourceFileShare,
-
-    [Parameter(Mandatory = $true)]
-    [string]$sourceStorageKey,
-
-    [Parameter(Mandatory = $true)]
-    [string]$destinationSubscriptionId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$destinationStorageAccount,
-
-    [Parameter(Mandatory = $true)]
-    [string]$destinationFileShare,
-
-    [Parameter(Mandatory = $true)]
-    [string]$destinationStorageKey
+# Define your checks (host + port)
+$checks = @(
+    @{ Name = "PostgreSQL Local"; ComputerName = "localhost"; Port = 5432 },
+    @{ Name = "SQL Server Local"; ComputerName = "localhost"; Port = 1433 },
+    @{ Name = "API Service";      ComputerName = "localhost"; Port = 3001 },
+    @{ Name = "Remote Server 1";  ComputerName = "192.168.1.50"; Port = 5432 },
+    @{ Name = "Remote Server 2";  ComputerName = "192.168.1.60"; Port = 1433 }
 )
 
-# Authenticate to Azure (handled by Automation Account)
-Connect-AzAccount
+# Run Test-NetConnection for each check
+foreach ($check in $checks) {
+    Write-Host "==============================="
+    Write-Host "Testing $($check.Name) on $($check.ComputerName):$($check.Port)..."
+    Write-Host "==============================="
 
-# Set source subscription context
-Set-AzContext -SubscriptionId $sourceSubscriptionId
-Write-Output "Using source subscription: $sourceSubscriptionId"
+    # Run tnc and capture result
+    $result = Test-NetConnection -ComputerName $check.ComputerName -Port $check.Port
 
-# Create source context using storage key
-$sourceContext = New-AzStorageContext -StorageAccountName $sourceStorageAccount -StorageAccountKey $sourceStorageKey
+    # Show the full details
+    $result
 
-# Set destination subscription context
-Set-AzContext -SubscriptionId $destinationSubscriptionId
-Write-Output "Using destination subscription: $destinationSubscriptionId"
-
-# Create destination context using storage key
-$destinationContext = New-AzStorageContext -StorageAccountName $destinationStorageAccount -StorageAccountKey $destinationStorageKey
-
-# Switch back to source subscription for listing files
-Set-AzContext -SubscriptionId $sourceSubscriptionId
-
-# List files in root of source file share
-$files = Get-AzStorageFile -ShareName $sourceFileShare -Context $sourceContext -Path ""
-
-foreach ($file in $files) {
-    if ($file.GetType().Name -eq "CloudFile") {
-        Write-Output "Copying file: $($file.Name)"
-
-        Start-AzStorageFileCopy `
-            -SrcShareName $sourceFileShare `
-            -SrcFilePath $file.Name `
-            -SrcContext $sourceContext `
-            -DestShareName $destinationFileShare `
-            -DestFilePath $file.Name `
-            -DestContext $destinationContext
+    # Add summary
+    if ($result.TcpTestSucceeded) {
+        Write-Host "✅ $($check.Name) - Connection successful" -ForegroundColor Green
+    } else {
+        Write-Host "❌ $($check.Name) - Connection failed" -ForegroundColor Red
     }
+    Write-Host ""
 }
